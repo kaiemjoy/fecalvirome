@@ -1,0 +1,788 @@
+---
+title: "WUHA Pilot enteric virome mBSFS-C analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+
+
+
+#Setup
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+remove(list=ls())
+
+#install phyloseq package
+#source('http://bioconductor.org/biocLite.R')
+#biocLite('phyloseq')
+
+
+#Load libraries
+library(tidyverse)
+library(vegan)
+library(phyloseq)
+library(forcats)
+library(ggsci)
+library(knitr)
+library(gridExtra)
+library(xtable)
+
+
+# Set working directory
+
+
+#Color pallette
+library(RColorBrewer)
+BrBG6 <- brewer.pal(9, name="BrBG")
+
+display.brewer.pal(9, name="BrBG")
+BrBG6 <- c("#8C510A" ,"#BF812D", "#DFC27D", "#80CDC1", "#35978F", "#01665E")
+
+
+
+```
+
+
+
+####load and prepare data 
+used this tutorial: 
+https://joey711.github.io/phyloseq/import-data.html
+```{r warning=FALSE}
+
+#otu - operational taxonomic unit ~  viruses being studied 
+otu <- read.csv("otu_file2.csv", row.names = "OTU")
+
+#taxa - taxonomy table, this still need ssome work and not even sure if it works in phyloseq
+taxa <- read.csv("taxa_file.csv")
+
+#sample_data/ map file links the sample id to characteristics of the sample (like intervention group and bsfs category)
+map <- (read.csv("pooldata_mapfile.csv") %>% 
+        mutate(bsfs = fct_relevel(bsfs, "watery", "loose", "snake", "lumpy", "pellet"),
+              loosewat = fct_collapse(bsfs,
+                                 "loose/watery" = c("watery", "loose"),
+                                 "formed" = c("lumpy", "pellet", "snake")),
+              bsfs = fct_recode(bsfs, "Watery" = "watery", "Loose" = "loose", "Smooth" = "snake", "Lumpy" = "lumpy", "Pellet" = "pellet"))
+        )
+
+
+# Format data for phyloseq 
+
+#OTU table
+#-------------------
+
+#change NAs to 0S in otu table
+otu[is.na(otu)] <- 0
+
+#change otu table from data frame to matrix
+otumat <- data.matrix(otu, rownames.force = NA)
+
+
+#Map table
+#-------------------
+row.names(map)<- map$sample
+map$sample <- NULL
+
+
+
+#set reference levels for group comparison dichotomous variable
+map$group <- relevel(map$group, ref = "control")
+
+#create dummy variables for bsfs cat for CCA analysis
+A <- model.matrix(  ~  bsfs - 1 , map) 
+B <- model.matrix(  ~  loosewat - 1 , map) 
+C <- merge(A, B, by="row.names")
+
+row.names(C)<- C$"Row.names"
+C$"Row.names" <- NULL
+
+
+#merge dummy variables into map file
+map <- merge(map, C, by="row.names")
+map <- rename(map, Sample = Row.names, Loose = bsfsLoose, Watery=bsfsWatery, Smooth=bsfsSmooth, Pellet=bsfsPellet, Lumpy=bsfsLumpy, Iloosewat = "loosewatloose/watery", Iformed = loosewatformed)
+row.names(map)<- map$Row.names
+
+#read in id info (numer of kids per pool)
+id <- (read.delim("~/Box Sync/_Papers/_mBSFSVirus paper/Analysis_Final/IDinPool_virus.csv") %>%
+         mutate(Sample = factor(Sample)) %>%
+         group_by(Sample) %>%
+         summarise(NperPool = n()) %>%
+         mutate(Sample = paste("pool", Sample, sep=""))
+       )
+
+
+#Merge number of kids with map file 
+map <- merge(map, id, by="Sample")
+row.names(map)<- map$Sample
+map$Sample <- NULL
+
+#taxa table
+#-------------------
+#define row names for taxa file to be OTU units and drop OTU id column 
+rownames(taxa) <- taxa$OTU
+taxa$OTU <- NULL
+
+taxa <- within(taxa, levels(genotype)[levels(genotype) == "Adeno-associated virus - 2"] <- "AAV2")
+
+
+
+#change taxa table to matrix
+taxmat = as.matrix(taxa)
+
+
+```
+
+
+#### Data transformations (Raw, Normalized)
+```{r}
+#create vector of total reads 
+TotalReads <- otumat[43,]
+
+#otumat = Raw counts (remove total reads column)
+otumat <- otumat[-43,]
+
+#otumatN = Normalized by TotalReads
+otumatN <- otumat*100/TotalReads[col(otumat)]
+
+```
+
+
+
+
+####define the data for phyloseq package 
+The phyloseq package organizes and synthesizes the different data types into a single data object that can be easily manipulated. 
+```{r}
+#otu table, viruses are rows
+OTU = otu_table(otumat, taxa_are_rows = TRUE)
+
+OTU_N = otu_table(otumatN, taxa_are_rows = TRUE)
+
+TAX = tax_table(taxmat)
+
+sampledata = sample_data(map)
+
+#combine all into a phyloseq object
+vir.data = phyloseq(OTU, TAX, sampledata)
+
+vir.dataN = phyloseq(OTU_N, TAX, sampledata)
+
+
+
+#melt phyloseq object into data frame (select Normalize = N, log tranformed = L or raw)
+d <- psmelt(vir.dataN)
+
+
+```
+
+
+#Characteristics of study population
+
+Table 1: population characteristics by stool consistency type. 
+need to load in id data and merge with wuha pilot data (age, fever, gender, etc.)
+```{r}
+
+
+
+id <- (read.delim("~/Box Sync/_Papers/_mBSFSVirus paper/Analysis_Final/IDinPool_virus.csv") %>%
+         rename(Pool=Sample, bsfs = bsfs_grade))
+       
+StudySample <- (read.csv("~/Box Sync/_Papers/Quantitative Bias analysis/analysis/data/validation_combinedcsv.csv",  na.strings = "", stringsAsFactors=TRUE) %>%
+                filter(studysite=="WUHA Pilot") %>%
+                rename(person_id = regcode) %>%
+                merge(id, by = "person_id") %>%
+                select(person_id, Pool, grade1, studyarm_wuhapilot, village, age, gender, bsfs, fever_past7, blood_past7, nextdaycollection_s) %>%
+                  mutate(ageM = age*12) )
+
+StudySample$blood_past7[is.na(StudySample$blood_past7)] <- "No"
+
+summary(StudySample$ageM)
+
+ggplot(StudySample, aes(ageM)) +
+  geom_histogram()
+
+median(StudySample$ageM,)
+quantile(StudySample$ageM, probs=.25)
+ quantile(StudySample$ageM, probs=.75)
+ 
+Table1 <- StudySample %>%
+    #mutate(fever_past7 = as.factor)
+    group_by(bsfs) %>%
+    summarize(nChildren = n(), 
+              nPools = length(unique(Pool)), 
+              #MeanAge = round(mean(age),1), 
+              #sdAge = round(sd(age), 2), 
+              MedianAge = round(median(ageM), 2), 
+              #IQRAge = IQR(ageM), 
+              Age.p25 = round(quantile(ageM, probs=.25), 2),
+              Age.p75 = round(quantile(ageM, probs=.75), 2),
+              prop.female=round(100*mean(gender == "FEMALE",  na.rm=TRUE),1),
+              prop.fever=round(100*mean(fever_past7 == "Yes",  na.rm=TRUE),1),
+              prop.blood=round(100*mean(blood_past7 == "Yes",  na.rm=TRUE),1),
+              nfever = sum(fever_past7 == "Yes", na.rm=TRUE),
+              nBlood = sum(blood_past7 == "Yes", na.rm=TRUE),
+              nFemale = sum(gender=="FEMALE", na.rm=TRUE)) %>%
+  
+      mutate(
+        Female = paste(nFemale," (",prop.female,"% )", sep=""),
+        Fever = paste(nfever, " (",prop.fever, "% )", sep=""),
+        BloodinStool = paste(nBlood, " (",prop.blood, "% )", sep=""),
+        N_Pools = paste (nChildren, " (",nPools , ")", sep=""),
+        #MeanAge = paste(MeanAge, " (", sdAge, ")", sep=""),
+        MedianAge = paste(MedianAge, " (", Age.p25, "-", Age.p75 , ")", sep="")) %>%
+    select(N_Pools,MedianAge,Female, BloodinStool, Fever) %>%
+      t %>%
+      as.data.frame() %>%
+      `colnames<-`(c("Pellets", "Lumpy", "Smooth", "Loose", "Watery")) %>%
+      select(Watery, Loose, Smooth, Lumpy, Pellets)
+    
+  
+
+
+print(xtable(Table1), include.rownames=TRUE, booktabs = TRUE)
+
+
+#anova comparing mean age by stool consistency groups. 
+anova <- aov(age~bsfs, data=StudySample)
+summary(anova)
+
+```
+
+#Prevalence
+
+Supplemental table 1: Prevalence
+```{r}
+#change to vir.data for total counts
+#d <- psmelt(vir.dataN)
+taxa <- as.data.frame(tax_table(vir.data))
+taxa$OTU <-row.names(taxa)
+
+#simplify species names
+taxa <- taxa %>%
+  mutate(Species_sim = recode_factor(species, "Parechovirus A" = NA_character_, "Hepatovirus A" = NA_character_),
+         Genotype_sim = recode_factor(genotype, "Human bocavirus 1" = "G1",
+                                                "Human bocavirus 2" = "G2",
+                                                "Human bocavirus 3" = "G3",
+                                                "Human bocavirus 4" = "G4"))
+
+taxa$Species <- ifelse(is.na(taxa$Species_sim),
+                       paste(taxa$Genotype_sim),
+                    paste(taxa$Species_sim, taxa$Genotype_sim, sep=", " ))
+
+taxa$Species <- ifelse(taxa$Genotype_sim=="",
+                       paste(taxa$Species_sim), 
+                       taxa$Species)
+
+
+
+#number of pools in each consistency type
+summary <- as.data.frame((sample_data(vir.data))) %>%
+  group_by(bsfs) %>%
+  summarise(N = n(),
+            kids = sum(NperPool))
+
+
+
+#generate count/presence absence variable
+
+STable1 <- d %>%
+          mutate(Presence = ifelse (Abundance > 0, 1, 0)) %>%
+          group_by(OTU, bsfs) %>%
+          summarise(Prevalence = sum(Presence)) %>%
+          spread(key=bsfs, value=Prevalence) %>%
+          mutate(wateryP = round(100*Watery/4, 1),
+                 looseP = round(100*Loose/8, 1),
+                 snakeP = round(100*Smooth/6, 1),
+                 lumpyP = round(100*Lumpy/9, 1),
+                 pelletP = round(100*Pellet/2, 1),
+                 overall = sum(Watery, Loose, Smooth, Lumpy, Pellet),
+                 overallP = round(100*overall/29, 1)) %>%
+          merge(taxa, .id="OTU")  %>%
+            ungroup()  %>%
+            mutate(Watery = paste(Watery, " (", wateryP,"%)", sep=""),
+                   Loose = paste(Loose, " (", looseP,"%)", sep=""),
+                   Smooth = paste(Smooth, " (", snakeP,"%)", sep=""),
+                   Lumpy = paste(Lumpy,  " (", lumpyP,"%)", sep=""),
+                   Pellets = paste(Pellet, " (", pelletP,"%)", sep=""),
+                   Overall = paste(overall, " (", overallP,"%)", sep="")) %>%
+            select(Species, Watery, Loose, Smooth, Lumpy, Pellets, Overall) %>%
+            #arrange(Overall)
+            arrange(Species)
+
+
+print(xtable(STable1), include.rownames=FALSE, booktabs = TRUE)
+
+```
+
+Figure 2: Prevalence by pool
+```{r}
+
+
+PrevalenceFigureDat <- d %>%
+          mutate(Presence = ifelse (Abundance > 0, 1, 0)) %>%
+          group_by(OTU, bsfs) %>%
+          summarise(Prevalence = sum(Presence)) %>%
+          spread(key=bsfs, value=Prevalence) %>%
+           mutate(PrevalenceTotal = sum(Watery, Loose, Smooth, Lumpy, Pellet)) %>%
+           merge(taxa, .id="OTU") %>%
+           mutate(Species = as.factor(Species),
+                  #Species = fct_reorder(Species, PrevalenceTotal, .desc = FALSE)) 
+                  Species = fct_reorder(Species, as.numeric(family), .desc = FALSE)) 
+  
+W <- ggplot(PrevalenceFigureDat, aes(x=Species, 
+                                  y=Watery))  +
+          geom_bar(stat="identity", fill = "#01665E") +
+          coord_flip() +
+          theme_minimal() +
+          scale_y_continuous(limits = c(0,4),
+                              expand = c(0,0),
+                             minor_breaks = NULL) +
+          scale_fill_manual(values = BrBG5) +
+          labs (y = "Watery") +
+          theme(plot.margin = NULL)
+  
+Ls <- ggplot(PrevalenceFigureDat, aes(x=Species, 
+                                  y=Loose))  +
+          geom_bar(stat="identity", fill = "#35978F") +
+          coord_flip() +
+          theme_minimal() +
+          scale_y_continuous(limits = c(0,8),
+                              expand = c(0,0),
+                             breaks = seq(0,8),
+                             minor_breaks = NULL) +
+          scale_fill_manual(values = BrBG5) +
+          labs (y = "Loose", x = "") +
+          theme(axis.text.y = element_blank() ,
+                plot.margin = NULL)
+  
+ 
+S <- ggplot(PrevalenceFigureDat, aes(x=Species, 
+                                  y=Smooth))  +
+          geom_bar(stat="identity", fill = "#DFC27D") +
+          coord_flip() +
+          theme_minimal() +
+          scale_y_continuous(limits = c(0,6),
+                              expand = c(0,0),
+                             breaks = seq(0,6),
+                             minor_breaks = NULL) +
+          scale_fill_manual(values = BrBG5) +
+          labs (y = "Smooth", x = "") +
+          theme(axis.text.y = element_blank() ,
+                plot.margin = NULL)
+
+Lm <- ggplot(PrevalenceFigureDat, aes(x=Species, 
+                                  y=Lumpy))  +
+          geom_bar(stat="identity", fill = "#BF812D") +
+          coord_flip() +
+          theme_minimal() +
+          scale_y_continuous(limits = c(0,9),
+                              expand = c(0,0),
+                             breaks = seq(0,9),
+                             minor_breaks = NULL) +
+          scale_fill_manual(values = BrBG5) +
+          labs (y = "Lumpy", x = "") +
+          theme(axis.text.y = element_blank() ,
+                plot.margin = NULL)  
+  
+P <- ggplot(PrevalenceFigureDat, aes(x=Species, 
+                                  y=Pellet))  +
+          geom_bar(stat="identity", fill = "#8C510A") +
+          coord_flip() +
+          theme_minimal() +
+          scale_y_continuous(limits = c(0,2),
+                              expand = c(0,.05),
+                             breaks = seq(0,2),
+                             minor_breaks = NULL) +
+          scale_fill_manual(values = BrBG5) +
+          labs (y = "Pellet", x = "") +
+          theme(axis.text.y = element_blank(),
+                plot.margin = NULL)
+
+#library(gtable)
+
+
+Figure2 <- grid.arrange(W,Ls,S,Lm,P, nrow=1, widths = c(3.5,1,1,1,1))
+
+
+  ggsave("Figure2.Prevalence.pdf", plot = Figure2, width = 8, height=10, path = "~/Box Sync/_Papers/_mBSFSVirus paper/BSFS Paper/Figures")
+  
+
+
+
+
+```
+
+
+#Abundance
+
+```{r}
+# d is relatived abundance (normalizzed reads)
+#d <- psmelt(vir.dataN)
+
+#d2 is raw reads
+d2 <- psmelt(vir.data)
+
+
+AbundanceTableGt <- d2 %>%
+                group_by(OTU, bsfs) %>%
+                summarise(Abundance = round(sum(Abundance), 3)) %>%
+                spread(key=bsfs, value=Abundance) %>%
+                mutate(Overall = round(sum(Watery, Loose, Smooth, Lumpy, Pellet), 3)) %>%
+                merge(taxa, .id="OTU") %>%
+                ungroup() %>%
+                select(Species, Watery, Loose, Smooth, Lumpy, Pellet, Overall) %>%
+                #arrange(Species)
+                arrange(Overall)
+
+
+AbundanceTableFamily <- d %>%
+                group_by(family, bsfs) %>%
+                summarise(Abundance = round(sum(Abundance), 3)) %>%
+                spread(key=bsfs, value=Abundance) %>%
+                mutate(Overall = round(sum(Watery, Loose, Smooth, Lumpy, Pellet), 3)) %>%
+                ungroup() %>%
+                select(family, Watery, Loose, Smooth, Lumpy, Pellet, Overall) %>%
+                #arrange(Species)
+                arrange(Overall)
+
+AbundanceTableFamily 
+
+```
+
+
+
+Figure 3: Abundance, genotype level, color by family
+```{r}
+Figure3 <- plot_bar(vir.dataN, "bsfs", fill = "family", title= "") +
+            labs(x="mBSFS-C Stool Consistency Category", y="Abundance (Normalized)") +
+            geom_bar(color="white", size=2, stat="identity", position="stack") +
+            geom_bar(color = "darkgrey", size=.01, stat="identity", position="stack") +
+            scale_fill_brewer(name = "Family", palette = "BrBG") +
+            theme_minimal() +
+            theme(legend.position = c(0.9, 0.7), 
+                           #legend.key.height=unit(.4,"cm"), 
+                            #legend.key.width=unit(.4,"cm"),
+                            legend.text = element_text(size=7),
+                            legend.title = element_text(size=7),
+                           #legend.background = element_rect(fill=alpha('white', 0.7)),
+                           legend.key = element_blank(),
+                           axis.text = element_text(size=7), 
+                          axis.title = element_text(size=8))
+
+Figure3
+ggsave("Figure3.Abundance.pdf", plot = Figure3, width = 6, height=4, path = "~/Box Sync/_Papers/_mBSFSVirus paper/BSFS Paper/Figures")
+
+
+```
+
+
+##Differential Abundance
+
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+library(DESeq2)
+
+#Add age as a covariate 
+agepool <- StudySample %>%
+  group_by(Pool) %>%
+  summarise(MeanAge = mean(age),
+            MedianAge = median(age)) %>%
+  mutate(Pool = paste("pool",Pool, sep=""))
+
+mapAge <- map %>%
+  rownames_to_column(var="Pool") %>%
+  merge(agepool, by="Pool")
+
+row.names(mapAge) <- mapAge$Pool
+
+#define for phyloseq
+sampledataAge = sample_data(mapAge)
+
+
+#set reference levels for loose/watery dichotomous variable
+#sampledata$loosewat <- relevel(sampledata$loosewat, ref = "formed")
+sampledataAge$loosewat <- relevel(sampledataAge$loosewat, ref = "formed")
+
+#Change 0s to 1s to calculate geometric mean
+otumat1 <- otumat
+otumat1[otumat1==0] <- 1
+OTU1 = otu_table(otumat1, taxa_are_rows = TRUE)
+
+
+#compile new phyloseq object
+vir.data1 = phyloseq(OTU1, TAX, sampledataAge)
+
+#convert phyloseq object into deseq2 object
+#vir.dataDSq <- phyloseq_to_deseq2(vir.data1, ~ loosewat)
+
+#adjusting for age (Median or Mean)
+vir.dataDSq <- phyloseq_to_deseq2(vir.data1, ~ loosewat + MedianAge)
+#vir.dataDSq <- phyloseq_to_deseq2(vir.data1, ~ loosewat + MeanAge)
+
+
+#run DESeq negative binomial liklihood ratio tast 
+DifAbund <- DESeq(vir.dataDSq, test="LRT", fitType="local", reduced = ~1)
+
+
+
+#print results
+DifAbundTab <- results(DifAbund, cooksCutoff = FALSE, pAdjustMethod = "BH")
+alpha <- .1
+
+sigtab <- DifAbundTab %>%
+          as.data.frame() %>%
+          rownames_to_column(var="OTU") %>%
+          merge(taxa, .id="OTU") %>%
+          filter(padj <= alpha, 
+                 log2FoldChange>=1.2) %>%
+          mutate(lowerCI = round(log2FoldChange - 1.96*lfcSE,1),
+                 upperCI = round(log2FoldChange + 1.96*lfcSE,1)) 
+        #select(Species, log2FoldChange, lowerCI, upperCI)
+
+
+```
+
+
+
+
+Figure 4: Differential Abundance: Loose/watery stool compared to formed stool 
+```{r} 
+
+
+
+Figure4 <- ggplot(sigtab, aes(y=fct_reorder(Species, log2FoldChange, .desc=FALSE), 
+                              x=log2FoldChange, 
+                              color=fct_reorder(family, log2FoldChange, .desc = TRUE))) + 
+            scale_color_manual(name = "Family", values=BrBG6) +
+            geom_point(size=3, shape=18) + 
+            theme_minimal() +
+            #theme(axis.text.x = element_text(angle = -25, hjust = 0)) +
+            geom_vline(xintercept = 1) +
+            geom_text(aes(label=round(log2FoldChange,2), angle=25), hjust=0, nudge_y = 0.2, size=3.5, show.legend = FALSE) +
+            geom_errorbarh(aes(xmin=log2FoldChange-(1.96*lfcSE), xmax=log2FoldChange+(1.96*lfcSE)), height=.1, linetype="F1") +
+            labs(x="log2 fold change", y="") 
+            #scale_y_discrete(labels = function(x) str_wrap(x, width = 22)) 
+            #scale_x_continuous(limits=c(1,10), breaks=seq(1,10,by=2), minor_breaks = seq(1,10,by=2))
+
+Figure4
+ggsave("Figure4.DifferentialAbundance.pdf", plot = Figure4, width = 8, height=4.5, path = "~/Box Sync/_Papers/_mBSFSVirus paper/BSFS Paper/Figures")
+
+
+
+
+
+
+  
+```
+
+
+Table 2: Relative abundance and log fold change
+```{r}
+
+
+A <- psmelt(vir.data)
+
+A1 <- sigtab %>%
+  merge(A, by = "OTU") %>%
+  group_by(OTU) %>%
+  summarise(AbundanceLooseRaw = round(sum(Abundance[loosewat=="loose/watery"]), 1),
+            AbundanceFormedRaw = round(sum(Abundance[loosewat=="formed"]), 1)) %>%
+  select(OTU, AbundanceLooseRaw, AbundanceFormedRaw) 
+  
+D1 <- sigtab %>%
+  merge(d, by = "OTU") %>%
+  group_by(OTU) %>%
+  summarise(AbundanceLoose = round(sum(Abundance[loosewat=="loose/watery"]), 2),
+            AbundanceFormed = round(sum(Abundance[loosewat=="formed"]), 2)) %>%
+  select(OTU, AbundanceLoose, AbundanceFormed) 
+
+Table2 <- sigtab %>%
+  merge(A1,  by = "OTU") %>%
+  merge(D1,  by = "OTU") %>%
+  mutate(logFoldChange = paste( round(log2FoldChange, 2), " (", round(lowerCI,1), " , ", round(upperCI,1), ")", sep="" ),
+         Abundance_Loose = paste (AbundanceLooseRaw, " (", AbundanceLoose, ")", sep = ""),
+         Abundance_Formed = paste (AbundanceFormedRaw, " (", AbundanceFormed, ")", sep = ""),
+         PValue =round(pvalue, 3),
+         AdjPValue = round(padj, 3)) %>%
+  arrange(-log2FoldChange) %>%
+  select(Species, Abundance_Loose, Abundance_Formed, logFoldChange, PValue, AdjPValue)
+
+#To print out 3 decimal p-values
+#print(xtable(Table2, include.rownames=FALSE, booktabs = TRUE, digits = c(0,0,0,0,0,3,3))
+
+print(xtable(Table2), include.rownames=FALSE, booktabs = TRUE, digits = c(0,0,0,0,0,3,3))
+
+
+```
+
+
+
+
+#Alpha Diversity
+
+Richness
+```{r}
+RichnessTab <- d %>%
+            mutate(Vcount = ifelse (Abundance > 0, 1, 0)) %>%
+            #filter(family== "Adenoviridae") %>%
+            group_by(Sample, bsfs, group, loosewat, NperPool) %>%
+            summarise(Abundance = sum(Abundance), 
+                      VirCount = sum(Vcount)) %>%
+            group_by(bsfs) %>%
+            summarize(Npools = length(Abundance), 
+                      medianVcount = median(VirCount), 
+                      Min = min(VirCount),
+                      Max = max(VirCount),
+                      IQR = iqr(VirCount),
+                      mean=mean(Abundance), 
+                      sd = sd(Abundance)) %>%
+            mutate(SE = sd/sqrt(Npools), lower = mean - 1.96*SE, upper = mean + 1.96*SE)
+
+```
+
+
+
+
+Figure 5: Species richness according to mBSFS-C stool consistency category 
+```{r}
+ 
+observed <- estimate_richness(vir.data, split=TRUE, measures = "Observed") %>%
+            merge(map, by="row.names")
+
+observed$bsfsNum <- as.numeric(observed$bsfs)
+  
+
+ Figure5 <- ggplot(observed, aes(x=bsfs, y=Observed)) +
+              geom_boxplot() +
+              #geom_smooth(aes(x=bsfsNum, y=Observed), color="#8C510A", se=FALSE, size = .7) +
+              labs(x="Stool Consistency", y="Richness") +
+              geom_jitter(position = position_jitter(width = .25, height=0), aes(size=NperPool), alpha=.4) +
+              stat_summary(fun.y = "mean", color = "#8C510A", geom="point", size=2, shape=4, stroke=.7) +
+              theme_minimal() +
+              theme(legend.position="none",
+                    axis.text = element_text(size=9)) +
+              guides(size = guide_legend(title="N kids per pool", nrow=1,ncol=7), byrow=TRUE) +
+              theme(legend.position="bottom",
+                    axis.text = element_text(size=9), 
+                    legend.text = element_text(size=9),
+                    legend.title = element_text(size=8),
+                    strip.text.x =  element_blank())   +
+              guides(size = guide_legend(title="N kids per pool", nrow=1,ncol=7), byrow=TRUE) +
+              scale_y_continuous(breaks = 1:10, minor_breaks = 1:10) +
+              geom_point(aes(color = "mean"), alpha = 0)+  
+              guides(color=guide_legend(title=NULL, override.aes = list(alpha = 1, color ="#8C510A", shape=4, stroke = 1, size=1.5 )))
+
+
+
+ggsave("Figure5.Richness.pdf", plot = Figure5, width = 6, height=4, path = "~/Box Sync/_Papers/_mBSFSVirus paper/BSFS Paper/Figures")
+
+
+```
+
+
+Supplemental Figure 1: Viral diversity using simpson and fisher distance metrics by mBSFS-C stool consistency category
+```{r}
+
+
+A <- plot_richness(vir.data, x="bsfs", measures=c("Simpson", "Shannon", "Fisher")) + 
+      geom_boxplot() +
+      #labs (title = "Alpha diversity by stool consistancy category ", x="", subtitle = "Each point is a pool, size is number of       kids per pool", caption = "Red dot is mean") +
+      labs(x="") +
+      #scale_y_continuous(breaks=1:10)+
+      geom_jitter(position = position_jitter(width = .25, height=0), aes(size=NperPool), alpha=.1) +
+      stat_summary(fun.y = "mean", color = "#8C510A", geom="point", size=1, shape=4, stroke=1) +
+      #guides(size=guide_legend(title="N kids per pool"), alpha=FALSE) +
+      theme_minimal() +
+      theme(legend.position="none",
+            axis.text = element_text(size=6)) +
+      guides(size = guide_legend(title="N kids per pool", nrow=1,ncol=7), byrow=TRUE)
+
+
+B <- plot_richness(vir.data, x="loosewat", measures=c("Simpson", "Shannon", "Fisher")) + 
+      geom_boxplot(show_guide=FALSE) +
+      #labs (title = "Alpha diversity by stool consistancy category ", x="", subtitle = "Each point is a pool, size is number of kids per pool", caption = "Red dot is mean") +
+      labs(x="") +
+      #scale_y_continuous(breaks=1:10)+
+      geom_jitter(position = position_jitter(width = .25, height=0), aes(size=NperPool), alpha=.1) +
+      stat_summary(fun.y = "mean", color="#8C510A",  geom="point", shape = 4, size=1, stroke=1, show_guide=F  )  +
+      #guides(size=guide_legend(title="N kids per pool"), alpha=FALSE) +
+      theme_minimal() +
+      theme(legend.position="bottom",
+            axis.text = element_text(size=6), 
+            legend.text = element_text(size=6),
+            legend.title = element_text(size=8),
+            strip.text.x =  element_blank())   +
+      guides(size = guide_legend(title="N kids per pool", nrow=1,ncol=7), byrow=TRUE) +
+      #scale_colour_manual(name='',values=c('Mean'="#8C510A"))
+      geom_point(aes(color = "mean"), alpha = 0)+  
+      guides(color=guide_legend(title=NULL, override.aes = list(alpha = 1, color ="#8C510A", shape=4, stroke = 1, size=1.5 )))
+
+
+
+
+
+
+
+SuppFig1 <- grid.arrange(A,B, ncol=1)
+
+ggsave("SupplementalFigure1.AlphaDiversity.pdf", plot = SuppFig1, width = 5, height=9, path = "~/Box Sync/_Papers/_mBSFSVirus paper/BSFS Paper/Figures")
+
+```
+
+
+
+
+#Statistical tests, evaluating differences in richness 
+```{r}
+d.observed <- estimate_richness(vir.data)
+d.stats <- cbind(d.observed, sample_data(vir.data))
+
+
+
+#Kruscal Wallis
+kruskal.test(Observed~bsfs, data = d.stats)
+kruskal.test(Simpson~bsfs, data = d.stats)
+kruskal.test(Fisher~bsfs, data = d.stats)
+
+
+kruskal.test(Observed~loosewat, data = d.stats)
+kruskal.test(Simpson~loosewat, data = d.stats)
+kruskal.test(Fisher~loosewat, data = d.stats)
+
+
+#Dunn test
+library(dunn.test)
+dunn.test(d.stats$Observed, d.stats$bsfs, method="none")
+
+
+#spearman
+
+d.stats$bsfsNum <- as.numeric(d.stats$bsfs)
+corr <- cor.test(x=d.stats$bsfsNum, y=d.stats$Observed, method = 'spearman')
+
+corr
+
+Sim <- cor.test(x=d.stats$bsfsNum, y=d.stats$Simpson, method = 'spearman')
+
+Sim
+
+Fish <- cor.test(x=d.stats$bsfsNum, y=d.stats$Fisher, method = 'spearman')
+
+Fish
+
+Shan <- cor.test(x=d.stats$bsfsNum, y=d.stats$Shannon, method = 'spearman')
+
+Shan
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
